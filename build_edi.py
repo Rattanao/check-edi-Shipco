@@ -443,6 +443,7 @@ def parse_manifest(path):
     declared = {}   # ยอดรวมที่ MANIFEST ระบุเอง (GRAND TOTAL: ...) ถ้ามี
     MAN, i, n = {}, 0, len(rows)
     END = re.compile(r'^(PORT TOTAL|GRAND TOTAL|TOTAL\b|PortOfDischarge)', re.I)
+    END_FOOTER = re.compile(r'^(PORT TOTAL|GRAND TOTAL|PortOfDischarge)', re.I)
     ST_TOK = ('CY/CY', 'CY-CY', 'LCL/CFS', 'CFS/CFS', 'FCL/CFS', 'CY', 'LCL', 'CFS', 'FCL')
 
     # PORT OF DISCHARGE ต่อ 'หน้า' (พิมพ์ซ้ำในหัวตารางทุกหน้า อาจเปลี่ยนค่าได้ระหว่างไฟล์) — ใช้ตอน
@@ -501,7 +502,9 @@ def parse_manifest(path):
             # END ปกติอยู่คอลัมน์ 0 (เช่น 'PortOfDischarge: ...' ท้ายทุกหน้า) แต่ตัวสรุปยอดรวมทั้งฉบับ
             # ท้ายไฟล์จริง ('PORT TOTAL:' / 'TOTAL MEASUREMENT:' ฯลฯ) บางไฟล์พิมพ์เยื้องไปคอลัมน์ 1 แทน
             # — เช็คทุกคอลัมน์ในแถว ไม่งั้นบล็อก B/L สุดท้ายจะดูดข้อความสรุปยอดปนเข้า marks ไปเงียบๆ
-            if any(END.match(_cell(rows[j], k)) for k in range(len(rows[j]))):
+            # คอลัมน์อื่นที่ไม่ใช่ 0 เช็คเฉพาะป้ายสรุปจริง (PORT TOTAL / GRAND TOTAL / PortOfDischarge) — ข้อความ MARKS ที่
+            # ขึ้นต้นว่า 'TOTAL G.W/T: ...' (ลูกค้าพิมพ์ในช่อง marks) ห้ามถือเป็นท้ายบล็อก ไม่งั้นตู้/สินค้าของ B/L นั้นหายไป
+            if any((END if k == 0 else END_FOOTER).match(_cell(rows[j], k)) for k in range(len(rows[j]))):
                 j += 1
                 break
             if a.startswith('C :'):
@@ -944,6 +947,8 @@ def parse_enter(path, bl_re):
     # เลย์เอาต์แบบที่ E ("CUSTOMS IMPORT MANIFEST" ของ Shipco Transport) — ดู parse_enter_layout_e()
     ENT_E = parse_enter_layout_e(doc, bl_re, ent_annot)
     layout_e_trusted = _trusted(ENT_E[1], ENT_E[2])
+    if ENT_E[3]:    # ยอดรวมของเอกสาร Shipco รวมทุกตู้ในไฟล์ (ตู้ละ 1 ครั้ง) แทน regex ทั่วไปที่จับได้แค่เอกสารแรก
+        declared = ENT_E[3]
     for bl, rec in ENT_E[0].items():
         rec['low_confidence'] = not layout_e_trusted
         ENT[bl] = rec
@@ -1300,30 +1305,53 @@ _LE_DEST_LBL_RE = re.compile(r'^DESTINATION$', re.I)
 
 
 def parse_enter_layout_e(doc, bl_re, ent_annot):
-    """คืน (records:dict[bl->rec], n_success, n_anchor). anchor = คำว่า 'CUSTOMS BL' ที่พิมพ์ซ้ำทุกบล็อก (อยู่แถว
-       บนสุดของบล็อก ก่อนบรรทัด 'ACTUAL CONSIGNEE' ของบล็อกเดียวกันเล็กน้อย). เลขตู้พิมพ์ครั้งเดียวที่หัวเอกสาร
-       ('CONTAINER NUMBER' + ค่าอยู่บรรทัดถัดลงมา) ใช้กับทุก B/L. STATUS มักเป็น FreeText ครั้งเดียวทั้งฉบับ
-       ('...-ทุกBL') ซึ่งจัดการใน parse_enter() ผ่าน doc_wide แล้ว."""
+    """คืน (records:dict[bl->rec], n_success, n_anchor, declared). anchor = คำว่า 'CUSTOMS BL' ที่พิมพ์ซ้ำทุกบล็อก
+       (อยู่แถวบนสุดของบล็อก ก่อนบรรทัด 'ACTUAL CONSIGNEE' ของบล็อกเดียวกันเล็กน้อย).
+       ไฟล์ ENTER หนึ่งไฟล์อาจรวมหลายเอกสาร (หลายตู้ ต่อกันหลายหน้า และอาจมีสำเนาซ้ำ/ฉบับ REVISED ของเอกสารเดิม)
+       — เลขตู้พิมพ์ครั้งเดียวที่หัวหน้าแรกของแต่ละเอกสาร ('CONTAINER NUMBER' + ค่าอยู่บรรทัดถัดลงมา) ใช้กับทุก
+       B/L ของเอกสารนั้นจนกว่าจะเจอหัวเอกสารใหม่ ; ยอดรวมท้ายเอกสาร ('TOTAL' ที่คอลัมน์ซ้ายสุด) รวมเฉพาะ
+       "ตู้ละ 1 ครั้ง" (สำเนาซ้ำของตู้เดิมไม่นับซ้ำ). STATUS มักเป็น FreeText ครั้งเดียวทั้งฉบับ ('...-ทุกBL')
+       ซึ่งจัดการใน parse_enter() ผ่าน doc_wide แล้ว."""
     full_text_upper = '\n'.join(doc[p].get_text() for p in range(doc.page_count)).upper()
     if 'ACTUAL CONSIGNEE' not in full_text_upper or 'ARN NUMBER' not in full_text_upper:
-        return {}, 0, 0
+        return {}, 0, 0, {}
 
-    master_cont = ''
-    lines0 = [(y, x, t) for y, x, t in _page_lines(doc[0])]
-    cont_lbl = next(((y, x) for y, x, t in lines0 if re.match(r'^CONTAINER\s*NUMBER$', t, re.I)), None)
-    if cont_lbl:
-        ly, lx = cont_lbl
-        below = sorted((y, t) for y, x, t in lines0 if abs(x - lx) < 5 and y > ly)
-        cm = CONT_RE.search(below[0][1]) if below else None
-        master_cont = cm.group(0) if cm else ''
-
-    ENT, n_anchor = {}, 0
+    ENT, n_anchor, n_ok = {}, 0, 0
+    cur_cont = ''
+    doc_totals = {}     # ตู้ -> (จำนวนชิ้น, น้ำหนัก, ปริมาตร) ของเอกสารนั้น (ตู้ละ 1 ครั้ง)
     for p in range(doc.page_count):
-        raw = [(y, x, t) for y, x, t in _page_lines(doc[p]) if not re.search(r'©|All rights reserved', t, re.I)]
+        # PyMuPDF ดึงข้อความของ FreeText annotation (ที่ลูกค้าเขียนทับ เช่น '***as attn***', '**REVISED**', เลขลำดับเอกสาร)
+        # ปนมากับข้อความหน้ากระดาษด้วย — ตัดบรรทัดที่อยู่ในกรอบ annotation ออก ไม่ให้ไปปนใน MARKS/DESCRIPTION
+        ann = [(a.rect, re.sub(r'\s+', ' ', a.info.get('content', '')).strip()) for a in (doc[p].annots() or [])
+               if a.type[1] == 'FreeText']
+
+        def _in_annot(y, x, t):
+            return any(r.x0 - 2 <= x <= r.x1 + 2 and r.y0 - 2 <= y <= r.y1 + 2 and t in txt for r, txt in ann if txt)
+
+        raw = [(y, x, t) for y, x, t in _page_lines(doc[p])
+               if not re.search(r'©|All rights reserved', t, re.I) and not _in_annot(y, x, t)]
         raw.sort(key=lambda r: (round(r[0], 1), r[1]))
-        tot_i = next((i for i, (_, _, t) in enumerate(raw) if t.strip().upper() == 'TOTAL'), None)
+
+        cont_lbl = next(((y, x) for y, x, t in raw if re.match(r'^CONTAINER\s*NUMBER$', t, re.I)), None)
+        if cont_lbl:    # หน้าแรกของเอกสารใหม่ — เปลี่ยนตู้
+            ly, lx = cont_lbl
+            below = sorted((y, t) for y, x, t in raw if abs(x - lx) < 5 and y > ly)
+            cm = CONT_RE.search(below[0][1]) if below else None
+            cur_cont = cm.group(0) if cm else ''
+
+        # 'TOTAL' ของแถวยอดรวมท้ายเอกสารอยู่คอลัมน์ซ้ายสุดเท่านั้น — คำว่า TOTAL ในคอลัมน์ MARKS ของบล็อกใดบล็อกหนึ่ง
+        # ('TOTAL G.W/T : ... KGS') ต้องไม่ถูกตัดเป็นท้ายเอกสาร ไม่งั้นบล็อกที่เหลือใต้มันหายไปทั้งหมด
+        tot_i = next((i for i, (_, x, t) in enumerate(raw) if x < _LE_CONS_MAX and t.strip().upper() == 'TOTAL'), None)
         if tot_i is not None:
+            foot = [t for _, _, t in raw[tot_i:]]
             raw = raw[:tot_i]    # แถวยอดรวมท้ายเอกสาร ต้องไม่ปนเข้าบล็อกสุดท้าย
+            ftxt = ' '.join(foot)
+            mp = next((t for t in foot if re.fullmatch(r'[\d,]+', t)), None)
+            mm_ = re.search(r'([\d,.]+)\s*CBM', ftxt, re.I)
+            mg_ = re.search(r'([\d,.]+)\s*KGS', ftxt, re.I)
+            if mp and mm_ and mg_ and cur_cont not in doc_totals:
+                doc_totals[cur_cont] = (int(mp.replace(',', '')), float(mg_.group(1).replace(',', '')),
+                                        float(mm_.group(1).replace(',', '')))
         starts = [i for i, (_, x, t) in enumerate(raw)
                   if _LE_CONS_MAX <= x < _LE_BL_MAX and _LE_ANCHOR_RE.match(t)]
         for si, i0 in enumerate(starts):
@@ -1337,6 +1365,7 @@ def parse_enter_layout_e(doc, bl_re, ent_annot):
             bl = (bl_col[0] + bl_col[1]).strip()
             if not bl_re.match(bl):
                 continue
+            n_ok += 1
             cons = ' '.join(t for _, x, t in band if x < _LE_CONS_MAX and not _LE_CONS_LBL_RE.match(t))
             marks = ' '.join(t for _, x, t in band if _LE_BL_MAX <= x < _LE_MARKS_MAX)
             pieces_line = next((t for _, x, t in band if _LE_MARKS_MAX <= x < _LE_PIECES_MAX), '')
@@ -1347,15 +1376,21 @@ def parse_enter_layout_e(doc, bl_re, ent_annot):
             meas_line = next((t for _, x, t in band if x >= _LE_WEIGHT_MAX), '')
             rec = ent_annot.get(bl, {})
             combined = f'{marks} {desc}'.strip()
+            if bl in ENT:       # สำเนาซ้ำ/ฉบับแก้ไขของ B/L เดิม — ใช้ฉบับแรกที่พบ
+                continue
             ENT[bl] = {
-                'bl': bl, 'cons': cons.strip(), 'cont': master_cont, 'pkgs': pkgnum(pieces_line), 'pkgtype': pkgtype,
+                'bl': bl, 'cons': cons.strip(), 'cont': cur_cont, 'pkgs': pkgnum(pieces_line), 'pkgtype': pkgtype,
                 'gw': num(weight_line), 'meas': num(meas_line), 'marks': marks.strip(), 'desc': desc.strip(),
                 'status_raw': rec.get('status', ''),
                 'transit_raw': rec.get('transit', '') or (desc if TRANSIT_RE.search(desc) else ''),
                 'dg': rec.get('dg', '') or find_dg(combined),
                 'reefer': rec.get('reefer', '') or find_temp(combined),
             }
-    return ENT, len(ENT), n_anchor
+    declared = {}
+    if doc_totals:
+        declared = {'pkg': sum(v[0] for v in doc_totals.values()), 'gw': round(sum(v[1] for v in doc_totals.values()), 3),
+                    'meas': round(sum(v[2] for v in doc_totals.values()), 3)}
+    return ENT, n_ok, n_anchor, declared
 
 
 # ═══════════════════ 2b) ENTER.pdf — fallback ทั่วไปเมื่อไม่ตรงทั้ง layout A และ B ═══════════════════
